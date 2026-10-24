@@ -1427,8 +1427,8 @@ async function aiCall(prompt, opts) {
   const agent = AI_AGENTS.find(a => a.id === activeModelId) || AI_AGENTS[2];
   aiLog('info', 'Routing → ' + (agent ? agent.label : activeModelId));
   if (agent.kind === 'custom') {
-    // River agent endpoints come from the preset (it includes the CORS proxy in front of
-    // api.river.ai); the saved config may still point at OpenAI or another provider.
+    // River agents always use the preset's Cloudflare Worker, which forwards to River and
+    // answers the CORS preflight; the saved config may still point at another provider.
     return callCustomAPI(prompt, withRiverTransport({ ...API_PRESETS.river, ...(getApiConfig() || {}), model: agent.model }));
   }
   if (agent.kind === 'webllm') return callAI(prompt);
@@ -1438,29 +1438,19 @@ async function aiCall(prompt, opts) {
   throw new Error('No AI provider configured. Open the AI panel settings and add a provider, or load an offline model.');
 }
 
-// proxy.js relays POSTs to api.river.ai, so it is reached as <origin>/v1 with no key. It only
-// helps when the page is served by the proxy (http://localhost:3001); on any other origin —
-// a GitHub Pages deploy, say — that URL is a different machine and every request fails with
-// "Failed to fetch".
+// The Worker relays POSTs to api.river.ai and handles OPTIONS itself, so it is the only River
+// endpoint a hosted page can call. Requests go through it as-is; a saved River key travels in
+// the Authorization header, which the Worker forwards upstream.
+const RIVER_PROXY_BASE = 'https://studylens.opiraj6.workers.dev/v1';
+
 function isRiverProxyBase(baseURL) {
-  return /^https?:\/\/localhost:3001\/v1\/?$/.test(String(baseURL || ''));
+  return String(baseURL || '').replace(/\/+$/, '') === RIVER_PROXY_BASE;
 }
 
-function riverTransport() {
-  const here = location.protocol + '//' + location.host;
-  if (!/^https?:$/.test(location.protocol) || isRiverProxyBase(here + '/v1')) return 'proxy';
-  const key = getApiKey();
-  return key ? 'direct' : 'unavailable';
-}
-
-// River is a private endpoint, so the proxy is preferred; without it, only a user-supplied key
-// can reach the provider. Returns the config unchanged for every other provider.
+// Returns the config unchanged for every other provider.
 function withRiverTransport(cfg) {
   if (!isRiverProxyBase(cfg.baseURL)) return cfg;
-  const transport = riverTransport();
-  if (transport === 'proxy') return cfg;
-  if (transport === 'direct') return { ...cfg, baseURL: 'https://api.river.ai/v1' };
-  throw new Error('River.ai needs the local proxy (run node proxy.js and open http://localhost:3001) or a River API key — add one in AI settings, or pick another provider');
+  return cfg;
 }
 
 async function callPuter(prompt) {
@@ -2014,7 +2004,7 @@ $('aiModelStopBtn').onclick = stopDownload;
 
 // ---- Custom API settings modal ----
 const API_PRESETS = {
-  river:      { baseURL: 'http://localhost:3001/v1',                      model: 'deepseek-ai/DeepSeek-V4-Flash-0731',        needsKey: true },
+  river:      { baseURL: 'https://studylens.opiraj6.workers.dev/v1',                      model: 'deepseek-ai/DeepSeek-V4-Flash-0731',        needsKey: true },
   openai:     { baseURL: 'https://api.openai.com/v1',                      model: 'gpt-4o-mini',                              needsKey: true },
   groq:       { baseURL: 'https://api.groq.com/openai/v1',                 model: 'llama-3.3-70b-versatile',                   needsKey: true },
   openrouter: { baseURL: 'https://openrouter.ai/api/v1',                   model: 'google/gemini-2.0-flash-exp:free',          needsKey: true },
@@ -2090,7 +2080,7 @@ async function testApiConnection() {
   const btn = $('apiTestBtn');
   if (!cfg.baseURL || !cfg.model) return showApiTest('Enter a base URL and a model first.', false);
   if (!/^https?:\/\//.test(cfg.baseURL)) {
-    return showApiTest('Base URL must start with http:// or https:// (e.g. http://localhost:3001/v1)', false);
+    return showApiTest('Base URL must start with http:// or https:// (e.g. https://api.groq.com/openai/v1)', false);
   }
   btn.disabled = true;
   showApiTest('Testing…', true);
@@ -2122,9 +2112,7 @@ async function testApiConnection() {
       showApiTest('HTTP ' + resp.status + ': ' + (redactSecrets(body).slice(0, 200) || resp.statusText), false);
     }
   } catch (e) {
-    const local = /localhost|127\.0\.0\.1/.test(cfg.baseURL);
-    showApiTest(redactSecrets('Network error: ' + e.message +
-      (local ? ' (is proxy.js running? open the app via http://localhost:3001)' : ' (check base URL and CORS)')), false);
+    showApiTest(redactSecrets('Network error: ' + e.message + ' (check base URL and CORS)'), false);
   } finally {
     btn.disabled = false;
   }
