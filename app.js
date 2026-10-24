@@ -1429,14 +1429,38 @@ async function aiCall(prompt, opts) {
   if (agent.kind === 'custom') {
     // River agent endpoints come from the preset (it includes the CORS proxy in front of
     // api.river.ai); the saved config may still point at OpenAI or another provider.
-    const cfg = { ...API_PRESETS.river, ...(getApiConfig() || {}), baseURL: API_PRESETS.river.baseURL, model: agent.model };
-    return callCustomAPI(prompt, cfg);
+    return callCustomAPI(prompt, withRiverTransport({ ...API_PRESETS.river, ...(getApiConfig() || {}), model: agent.model }));
   }
   if (agent.kind === 'webllm') return callAI(prompt);
   const cfg = getApiConfig();
-  if (cfg && cfg.baseURL && cfg.model) return callCustomAPI(prompt, cfg);
+  if (cfg && cfg.baseURL && cfg.model) return callCustomAPI(prompt, withRiverTransport(cfg));
   if (aiEngineModel) return callAI(prompt);
   throw new Error('No AI provider configured. Open the AI panel settings and add a provider, or load an offline model.');
+}
+
+// proxy.js relays POSTs to api.river.ai, so it is reached as <origin>/v1 with no key. It only
+// helps when the page is served by the proxy (http://localhost:3001); on any other origin —
+// a GitHub Pages deploy, say — that URL is a different machine and every request fails with
+// "Failed to fetch".
+function isRiverProxyBase(baseURL) {
+  return /^https?:\/\/localhost:3001\/v1\/?$/.test(String(baseURL || ''));
+}
+
+function riverTransport() {
+  const here = location.protocol + '//' + location.host;
+  if (!/^https?:$/.test(location.protocol) || isRiverProxyBase(here + '/v1')) return 'proxy';
+  const key = getApiKey();
+  return key ? 'direct' : 'unavailable';
+}
+
+// River is a private endpoint, so the proxy is preferred; without it, only a user-supplied key
+// can reach the provider. Returns the config unchanged for every other provider.
+function withRiverTransport(cfg) {
+  if (!isRiverProxyBase(cfg.baseURL)) return cfg;
+  const transport = riverTransport();
+  if (transport === 'proxy') return cfg;
+  if (transport === 'direct') return { ...cfg, baseURL: 'https://api.river.ai/v1' };
+  throw new Error('River.ai needs the local proxy (run node proxy.js and open http://localhost:3001) or a River API key — add one in AI settings, or pick another provider');
 }
 
 async function callPuter(prompt) {
@@ -2070,11 +2094,18 @@ async function testApiConnection() {
   }
   btn.disabled = true;
   showApiTest('Testing…', true);
+  let target;
+  try {
+    target = withRiverTransport(cfg);
+  } catch (e) {
+    btn.disabled = false;
+    return showApiTest(e.message, false);
+  }
   const key = $('apiKey').value.trim();
   const headers = { 'Content-Type': 'application/json' };
   if (key) headers['Authorization'] = 'Bearer ' + key;
   try {
-    const resp = await fetch(cfg.baseURL + '/chat/completions', {
+    const resp = await fetch(target.baseURL + '/chat/completions', {
       method: 'POST',
       headers,
       targetAddressSpace: 'local',
