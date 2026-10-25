@@ -1427,9 +1427,12 @@ async function aiCall(prompt, opts) {
   const agent = AI_AGENTS.find(a => a.id === activeModelId) || AI_AGENTS[2];
   aiLog('info', 'Routing → ' + (agent ? agent.label : activeModelId));
   if (agent.kind === 'custom') {
-    // River agents always use the preset's Cloudflare Worker, which forwards to River and
-    // answers the CORS preflight; the saved config may still point at another provider.
-    return callCustomAPI(prompt, withRiverTransport({ ...API_PRESETS.river, ...(getApiConfig() || {}), model: agent.model }));
+    // River agents always go through the proxy that forwards to River; only the saved request
+    // settings are carried over. A baseURL saved before the proxy existed must not send the
+    // browser straight to River, which has no CORS headers and fails as "Failed to fetch".
+    const saved = getApiConfig() || {};
+    const river = { ...saved, baseURL: API_PRESETS.river.baseURL, model: agent.model };
+    return callCustomAPI(prompt, withRiverTransport(river));
   }
   if (agent.kind === 'webllm') return callAI(prompt);
   const cfg = getApiConfig();
@@ -1503,8 +1506,11 @@ async function callCustomAPI(prompt, cfg) {
   aiLog(resp.ok ? 'success' : 'error', 'HTTP ' + resp.status + ' in ' + (Date.now() - started) + 'ms');
   if (!resp.ok) {
     setAiProgress('hide');
+    // A static host answers an unrouted /v1 path with its 404 page, which is HTML or empty and
+    // would otherwise be reported as a JSON parse failure or an empty message.
     const body = await resp.text().catch(() => '');
-    throw new Error('HTTP ' + resp.status + ': ' + redactSecrets(body).slice(0, 200));
+    const detail = redactSecrets(body).trim().slice(0, 200);
+    throw new Error('HTTP ' + resp.status + (detail && /^[{[]/.test(detail) ? ': ' + detail : ' from ' + baseURL + (resp.status === 404 ? ' (proxy route not deployed?)' : '')));
   }
   let data;
   try {
@@ -1692,12 +1698,20 @@ function abortActiveDownload() {
 // modelType/lock maps and disposes the GPU device, and reload() will not unload a previous
 // model for us, so an engine left over from an aborted load or a lost device can never be
 // reused. The next load must build a fresh engine (which is what gets a fresh device).
+// unload() is not idempotent: it disposes the wasm handles behind every pipeline, and a second
+// call on the same engine (or any later chat through it) hits those freed handles and fails with
+// "Object has already been disposed". Mark the engine so it is unloaded at most once.
 async function unloadEngine() {
   const eng = aiEngine;
   aiEngine = null;
   aiEngineModel = null;
-  if (!eng) return;
+  if (!eng || eng.studyLensDisposed) return;
+  eng.studyLensDisposed = true;
   try { await eng.unload(); } catch (e) {}
+}
+// True when `eng` may still be used: it exists and has not been unloaded.
+function engineUsable(eng) {
+  return !!eng && !eng.studyLensDisposed;
 }
 // Pause: cancel the transfer now, keep every finished file, and offer Resume.
 function pauseDownload() {
@@ -1772,7 +1786,7 @@ async function loadModel(modelId, cb) {
   }
   // Already loaded? Confirm a real pipeline still exists (getMessage throws ModelNotLoadedError
   // when the loaded-pipeline map is empty, e.g. after a GPU device loss), otherwise reload.
-  if (aiEngine && aiEngineModel === modelId) {
+  if (engineUsable(aiEngine) && aiEngineModel === modelId) {
     try { await aiEngine.getMessage(modelId); return true; } catch (e) { /* fall through and reload */ }
   }
   // Never run two loads at once: wait out any load we detached from earlier.
@@ -1799,6 +1813,7 @@ async function loadModel(modelId, cb) {
     await preflightModelFiles(modelId);
     // Always start from a fresh engine (new device); never reuse the previous one.
     await unloadEngine();
+    if (token !== aiLoadToken) return false;   // Stop pressed during the preflight
     aiEngine = createEngine(mod, token);
     const load = aiEngine.reload(modelId);
     aiPendingLoad = load.catch(() => {});
@@ -1852,16 +1867,20 @@ async function loadModel(modelId, cb) {
           const mod = await loadWebLLM();
           aiLogPct = -1;
           aiEngine = createEngine(mod, token);
-          await aiEngine.reload(modelId);
-          continue;
+          const retryLoad = aiEngine.reload(modelId);
+          aiPendingLoad = retryLoad.catch(() => {});
+          await retryLoad;
+          aiPendingLoad = null;
         } catch (e2) {
+          aiPendingLoad = null;
           console.error('[WebLLM]', e2);
           setAiProgress('hide');
           aiLog('error', String((e2 && e2.message) || e2).slice(0, 200));
-          aiEngine = null;
+          await unloadEngine();
           cb.onError && cb.onError((e2 && e2.message) || 'Model did not finish loading');
           return false;
         }
+        continue;
       }
       setAiProgress('hide');
       aiLog('error', String((err && err.message) || err).slice(0, 200));
@@ -1878,18 +1897,20 @@ async function callAI(prompt, cb) {
   // The engine's loaded-pipeline map can go empty after a GPU device loss (WebLLM auto-unloads),
   // which makes chat throw ModelNotLoadedError. Probe the real pipeline and reload from cache if
   // it is gone, instead of trusting the aiEngineModel flag.
-  let ready = false;
-  try { if (aiEngine && aiEngineModel) { await aiEngine.getMessage(aiEngineModel); ready = true; } }
-  catch (e) { ready = false; }
-  if (!ready) {
-    // After a device loss WebLLM auto-unloads and empties its pipeline map, so the whole
-    // engine must be discarded (a new engine gets a new device) and the model reloaded
+  const ready = engineUsable(aiEngine) && !!aiEngineModel;
+  let ok = false;
+  if (ready) {
+    try { await aiEngine.getMessage(aiEngineModel); ok = true; } catch (e) { ok = false; }
+  }
+  if (!ok) {
+    // After a device loss (or a failed load) WebLLM auto-unloads and empties its pipeline map, so
+    // the whole engine must be discarded (a new engine gets a new device) and the model reloaded
     // from the browser cache before we can chat with it.
     await unloadEngine();
     if (!aiModelId) { cb.onError && cb.onError('No offline model loaded'); return null; }
     if (!(await loadModel(aiModelId, { onError: cb.onError }))) return null;
   }
-  if (!aiEngine || !aiEngineModel) {
+  if (!engineUsable(aiEngine) || !aiEngineModel) {
     aiLog('error', 'Local model not loaded — engine=' + !!aiEngine + ' model=' + aiEngineModel);
     cb.onError && cb.onError('Local model not loaded. Pick a cloud model or wait for the download to finish.');
     return null;

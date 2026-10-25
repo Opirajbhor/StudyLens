@@ -15,7 +15,7 @@ export async function onRequest(context) {
   }
 
   const url = new URL(request.url);
-  const targetUrl = 'https://api.river.ai' + url.pathname;
+  const targetUrl = 'https://api.river.ai' + url.pathname + url.search;
   const body = await request.text();
 
   try {
