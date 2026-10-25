@@ -1438,9 +1438,9 @@ async function aiCall(prompt, opts) {
   throw new Error('No AI provider configured. Open the AI panel settings and add a provider, or load an offline model.');
 }
 
-// The Worker relays POSTs to api.river.ai and handles OPTIONS itself, so it is the only River
-// endpoint a hosted page can call. Requests go through it as-is; a saved River key travels in
-// the Authorization header, which the Worker forwards upstream.
+// The Worker answers the CORS preflight and forwards the request upstream, so it is the only
+// River endpoint a hosted page can call. Requests go through it as-is; a saved River key travels
+// in the Authorization header, which the Worker forwards upstream.
 const RIVER_PROXY_BASE = 'https://studylens.opiraj6.workers.dev/v1';
 
 function isRiverProxyBase(baseURL) {
@@ -2239,7 +2239,7 @@ const AI_AGENTS = [
   { group: 'Cloud', id: 'puter-gemini', label: 'Puter Gemini', sub: 'Free, keyless', kind: 'puter', model: 'google/gemini-2.0-flash' }
 ];
 for (const m of AI_MODELS) {
-  AI_AGENTS.push({ group: 'Local', id: m.id, label: m.label.split(' - ')[0], sub: 'WebLLM', kind: 'webllm', model: null });
+  AI_AGENTS.push({ group: 'Local', id: m.id, label: m.label.split(' - ')[0], sub: 'WebLLM', kind: 'webllm', model: m.id });
 }
 
 let activeModelId = 'puter-gemini';
@@ -2254,7 +2254,7 @@ function setActiveModel(id) {
   renderAgentLabel();
   renderAgentPopover();
   if (agent.kind === 'webllm' && aiEngineModel !== agent.model && typeof startDownload === 'function') {
-    $('aiModelSelect').value = agent.model;
+    $('aiModelSelect').value = agent.id;
     startDownload();
   }
 }
