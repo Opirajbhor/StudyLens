@@ -2080,7 +2080,7 @@ $('aiModelStopBtn').onclick = stopDownload;
 
 // ---- Custom API settings modal ----
 const API_PRESETS = {
-  river:      { baseURL: 'https://studylens.opiraj6.workers.dev/v1',                      model: 'deepseek-ai/DeepSeek-V4-Flash-0731',        needsKey: true },
+  river:      { baseURL: 'https://studylens.opiraj6.workers.dev/v1',                      model: 'deepseek-ai/DeepSeek-V4.1-Flash',          needsKey: true },
   openai:     { baseURL: 'https://api.openai.com/v1',                      model: 'gpt-4o-mini',                              needsKey: true },
   groq:       { baseURL: 'https://api.groq.com/openai/v1',                 model: 'llama-3.3-70b-versatile',                   needsKey: true },
   openrouter: { baseURL: 'https://openrouter.ai/api/v1',                   model: 'google/gemini-2.0-flash-exp:free',          needsKey: true },
