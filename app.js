@@ -1546,9 +1546,9 @@ async function setCached(key, kind, page, output) {
 const WEBLLM_CDN = 'https://esm.run/@mlc-ai/web-llm@0.2.86';
 const MODEL_LIB_PREFIX = 'https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models/v0_2_86/base/';
 
-// Only these two models are offered, and both are registered explicitly so the app does
-// not depend on WebLLM's built-in list (which still leaves the DeepSeek 1.5B entry out).
-// Both wasm runtimes below were verified to exist (HTTP 200) in the v0_2_86 base folder.
+// Only these three models are offered, and all are registered explicitly so the app does
+// not depend on WebLLM's built-in list. Each model_lib matches the entry WebLLM 0.2.86 ships
+// for the same ID; every wasm below exists (HTTP 200) in the v0_2_86 base folder.
 const AI_MODELS = [
   {
     id: 'SmolLM2-360M-Instruct-q4f16_1-MLC',
@@ -1560,6 +1560,20 @@ const AI_MODELS = [
       model_lib: MODEL_LIB_PREFIX + 'SmolLM2-360M-Instruct-q4f16_1_cs1k-webgpu.wasm',
       vram_required_MB: 376.06,
       low_resource_required: true,
+      required_features: ['shader-f16'],
+      overrides: { context_window_size: 4096 }
+    }
+  },
+  {
+    id: 'SmolLM2-1.7B-Instruct-q4f16_1-MLC',
+    label: 'SmolLM2 1.7B Instruct - ~1 GB, balanced',
+    note: 'Middle option: much faster than DeepSeek and stronger than 360M.',
+    record: {
+      model: 'https://huggingface.co/mlc-ai/SmolLM2-1.7B-Instruct-q4f16_1-MLC',
+      model_id: 'SmolLM2-1.7B-Instruct-q4f16_1-MLC',
+      model_lib: MODEL_LIB_PREFIX + 'SmolLM2-1.7B-Instruct-q4f16_1_cs1k-webgpu.wasm',
+      vram_required_MB: 1774.33,
+      low_resource_required: false,
       required_features: ['shader-f16'],
       overrides: { context_window_size: 4096 }
     }
@@ -1707,9 +1721,12 @@ function createEngine(mod, token) {
 // Kick off (or resume) loading a model. Resolves to true once the model is usable.
 async function loadModel(modelId, cb) {
   cb = cb || {};
-  if (!webgpuSupported()) {
-    cb.onError && cb.onError('WebGPU is not available in this browser.');
-    return false;
+  // WebGPU presence is logged but not enforced: a worker that cannot do WebGPU surfaces its
+  // real error below, and the library import is the more useful failure when the CDN is down.
+  aiLog('info', 'WebGPU=' + (navigator.gpu ? 'available' : 'missing') + ' · crossOriginIsolated=' +
+    (self.crossOriginIsolated === true) + ' · modelId=' + modelId);
+  if (self.crossOriginIsolated !== true) {
+    aiLog('info', 'Cross-origin isolation off — some WebLLM builds/mirrors need COOP/COEP headers');
   }
   // Already loaded? Confirm a real pipeline still exists (getMessage throws ModelNotLoadedError
   // when the loaded-pipeline map is empty, e.g. after a GPU device loss), otherwise reload.
@@ -1726,7 +1743,13 @@ async function loadModel(modelId, cb) {
   aiEngineModel = null;                            // reload() unloads whatever was there
   aiProgressSink = cb.onProgress || null;
   try {
-    const mod = await loadWebLLM();
+    let mod;
+    try {
+      mod = await loadWebLLM();
+    } catch (importErr) {
+      aiLog('error', 'WebLLM import failed: ' + String((importErr && importErr.message) || importErr).slice(0, 200));
+      throw new Error('Could not load the WebLLM runtime' + (self.crossOriginIsolated === true ? '' : ' (page is not cross-origin isolated)') + ': ' + ((importErr && importErr.message) || importErr));
+    }
     if (token !== aiLoadToken) return false;   // Stop pressed while importing
     // Always start from a fresh engine (new device); never reuse the previous one.
     await unloadEngine();
@@ -1769,6 +1792,7 @@ async function loadModel(modelId, cb) {
       await aiEngine.getMessage(modelId);
       aiEngineModel = modelId;
       aiModelId = modelId;      // remember it so a later device loss can be healed from cache
+      aiLog('info', 'Pipeline ready for ' + modelId);
       setAiProgress('hide');
       aiLog('success', 'Model ready in ' + (Date.now() - loadStart) + 'ms');
       return true;
@@ -1817,7 +1841,11 @@ async function callAI(prompt, cb) {
     if (!aiModelId) { cb.onError && cb.onError('No offline model loaded'); return null; }
     if (!(await loadModel(aiModelId, { onError: cb.onError }))) return null;
   }
-  if (!aiEngine) { cb.onError && cb.onError('Model is still loading - please wait'); return null; }
+  if (!aiEngine || !aiEngineModel) {
+    aiLog('error', 'Local model not loaded — engine=' + !!aiEngine + ' model=' + aiEngineModel);
+    cb.onError && cb.onError('Local model not loaded. Pick a cloud model or wait for the download to finish.');
+    return null;
+  }
   cb.onStart && cb.onStart();
   aiLog('info', 'WebLLM → engine.chat');
   setAiProgress('indeterminate');
