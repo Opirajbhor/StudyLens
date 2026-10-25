@@ -1610,6 +1610,48 @@ function webgpuSupported() {
   return typeof navigator !== 'undefined' && !!navigator.gpu;
 }
 
+// A failed artifact fetch reaches us as a bare "Failed to fetch" with no URL or status, so the
+// dialog could not say whether the model repo, the wasm CDN or CORS was at fault. Requests that
+// fail while a model loads are recorded here and quoted in the error. Nothing else is affected:
+// every request still goes through the real fetch with unchanged arguments.
+let netFailures = [];
+let recordNetFailures = false;
+(function patchFetchForDiagnostics() {
+  const realFetch = window.fetch;
+  if (typeof realFetch !== 'function') return;
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+    return realFetch.call(this, input, init).catch((err) => {
+      if (recordNetFailures) {
+        const origin = (() => { try { return new URL(url, location.href).origin; } catch (e) { return ''; } })();
+        if (netFailures.length < 5) netFailures.push(origin + '/\u2026/' + url.split('?')[0].split('/').pop() + ' (' + ((err && err.message) || err) + ')');
+      }
+      throw err;
+    });
+  };
+})();
+
+// HTTP errors do not reject fetch(), so WebLLM's own 404 surfaces the same way. Fetch the model's
+// chat config ourselves first: it is the first file WebLLM asks for, and a failure here names the
+// real problem (wrong repo, blocked by CORS, offline) instead of "Failed to fetch".
+async function preflightModelFiles(modelId) {
+  const model = AI_MODELS.find(m => m.id === modelId);
+  if (!model) return;
+  const base = model.record.model.replace(/\/?$/, '/') + 'resolve/main/';
+  const check = async (name) => {
+    let resp;
+    try { resp = await fetch(base + name); } catch (e) { throw new Error(name + ': network error — ' + ((e && e.message) || e)); }
+    if (!resp.ok) throw new Error(name + ': HTTP ' + resp.status + (resp.status === 404 ? ' (this model file is missing from the HuggingFace repo)' : ''));
+    return resp;
+  };
+  await check('mlc-chat-config.json');
+  const cfg = await (await check('mlc-chat-config.json')).json();
+  const files = (cfg.tokenizer_files || []).slice();
+  const results = await Promise.all(files.map(f => check(f).then(() => f, e => String((e && e.message) || e))));
+  const failed = results.filter(r => /HTTP|error/i.test(r));
+  if (failed.length) throw new Error('Model files unfetchable: ' + failed.join('; '));
+}
+
 async function loadWebLLM() {
   if (!webllm) webllm = await import(WEBLLM_CDN);
   return webllm;
@@ -1742,6 +1784,9 @@ async function loadModel(modelId, cb) {
   aiDownloadDone = false;
   aiEngineModel = null;                            // reload() unloads whatever was there
   aiProgressSink = cb.onProgress || null;
+  netFailures = [];
+  recordNetFailures = true;
+  const stopRecording = () => { recordNetFailures = false; netFailures = []; };
   try {
     let mod;
     try {
@@ -1751,6 +1796,7 @@ async function loadModel(modelId, cb) {
       throw new Error('Could not load the WebLLM runtime' + (self.crossOriginIsolated === true ? '' : ' (page is not cross-origin isolated)') + ': ' + ((importErr && importErr.message) || importErr));
     }
     if (token !== aiLoadToken) return false;   // Stop pressed while importing
+    await preflightModelFiles(modelId);
     // Always start from a fresh engine (new device); never reuse the previous one.
     await unloadEngine();
     aiEngine = createEngine(mod, token);
@@ -1764,11 +1810,13 @@ async function loadModel(modelId, cb) {
     // deliberate cancel never surfaces a scary error (reload() may reject with AbortError).
     if (aiPaused || token !== aiLoadToken) return false;
     console.error('[WebLLM]', err);
+    const net = netFailures.length ? ' Unreachable: ' + netFailures.join(', ') : '';
+    stopRecording();
     setAiProgress('hide');
-    aiLog('error', String((err && err.message) || err).slice(0, 200));
+    aiLog('error', (String((err && err.message) || err) + net).slice(0, 200));
     await unloadEngine();       // drop the dead engine so the next load builds a fresh one
     aiProgressSink = null;
-    const m = (err && err.message) || 'Failed to load model';
+    const m = ((err && err.message) || 'Failed to load model') + net;
     cb.onError && cb.onError(/DEVICE_REMOVED|requestDevice|command queue|device lost/i.test(m)
       ? 'The GPU device was lost (likely out of GPU memory), so the download could not start. Reload the tab, then load one model and keep it loaded. Details: ' + m
       : m);
